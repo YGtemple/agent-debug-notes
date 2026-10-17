@@ -1,72 +1,80 @@
-# agent-debug-notes · Agent 调试经验笔记
+<div align="right">
 
-> 一句话简介：从 Codex、Trae、WorkBuddy 三个 Agent 的 39 个会话记录里，把反复踩过的坑整理成可复用的排查手册。
+**[English](README.md)** · [简体中文](README.zh-CN.md)
 
-内容来源：`.codex/sessions`（39 个 rollout 会话）、`.trae-cn/memory`（45 个 session_memory，743 条 learned）、`.workbuddy`（项目会话）。
+</div>
 
-筛选标准：**只保留带具体参数、命令、阈值、复现路径的结论**，不收录观点感悟。每条都标注了原始场景，方便回溯。
+# agent-debug-notes
+
+Debugging notes from 39 real sessions across Codex, Trae and WorkBuddy — the problems that cost the most time, written down so they cost it once.
+
+<sub>Markdown · no code, all conclusions traceable to a session</sub>
 
 ---
 
-## 一、ComfyUI 云端部署（AMD ROCm 实例）
+## What this is
 
-这部分占了大头——一台 Radeon Cloud 的 `gfx1100` AMD GPU 实例，从启动到跑 LTX-2.3 的完整踩坑链。
+Session transcripts are long and mostly redundant. The useful part is usually one sentence — the moment the actual cause was identified. These notes are that sentence, with enough context to reproduce the situation.
 
-### 1.1 「重新连接」的三层原因（最常见，按出现频率排序）
+Selection rule: **keep only conclusions that carry a specific parameter, command, threshold or reproduction path.** No general advice.
 
-ComfyUI 页面反复显示「重新连接」，**不是显卡问题**，是前后端连接断开。按这个顺序排查：
+## ComfyUI on an AMD ROCm instance
 
-| 现象 | 真实原因 | 判断方法 |
+This is the bulk of it — one `gfx1100` machine, from first start to running LTX-2.3.
+
+### "Reconnecting" has three different causes
+
+The ComfyUI page reconnecting is not a GPU problem. It is the front end losing the back end, and there are three distinct reasons, in order of how often they occur:
+
+| Symptom | Actual cause | How to tell |
 |---|---|---|
-| 页面能开，一执行就断 | **进程被显存压力杀掉** | `/queue`、`/history` 都返回 `Failed to fetch` |
-| 长时间生成后断 | **临时隧道被重置**（radeon-tunnel） | ComfyUI 进程还活着（`ps -p <PID>`） |
-| Notebook 单元结束就断 | **前台进程被连带清理** | PID 不存在，`/tmp/comfyui.log` 也没了 |
+| Opens fine, dies on execute | process killed by memory pressure | `/queue` and `/history` both return `Failed to fetch` |
+| Dies after a long generation | tunnel reset (radeon-tunnel) | ComfyUI process still alive |
+| Dies when the notebook cell ends | foreground process torn down with it | PID gone, `/tmp/comfyui.log` gone too |
 
-**关键判断**：如果 `/queue` 和 `/history` 都 `Failed to fetch`，说明后端连接真的断了，不是浏览器缓存。
+If `/queue` and `/history` both fail, the back end really is down — this is not a browser cache problem.
 
-### 1.2 前台启动是万恶之源
+### Foreground start is the root of most of it
 
-最初的启动方式是 Notebook 前台进程，导致 Jupyter 单元结束或连接波动时，**ComfyUI 和隧道进程被一起清理**。
-
-解决：改成独立后台会话启动，脱离 Notebook 单元生命周期：
+Running it as a notebook foreground process means the ComfyUI and tunnel processes get cleaned up whenever the cell ends or the Jupyter connection blips.
 
 ```bash
 nohup python main.py > /tmp/comfyui.log 2>&1 &
 ```
 
-**教训**：Notebook 的启动单元格必须一直保持运行——停止该单元格会关闭服务。这在调试时极容易忘。
+The notebook cell then has to stay running, which is easy to forget while debugging.
 
-### 1.3 22B BF16 模型显存硬退出
+### 22B BF16 exits hard
 
-加载 `ltx-2.3-22b-dev.safetensors`（22B BF16）后进程直接消失，日志里**没有 Python traceback**——这是 ROCm/显存压力下的硬退出，不是代码错误。
+Loading `ltx-2.3-22b-dev.safetensors` makes the process disappear with **no Python traceback in the log**. That is a hard exit under ROCm memory pressure, not a code error.
 
-有效参数组合（按优先级）：
+Working parameter set, in order of importance:
 
 ```bash
-# 1. AMD 显存分段（必配）
+# 1. AMD memory segmentation (required)
 export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
 
-# 2. 关闭异步权重换入 —— gfx1100 上这是最容易硬退出的路径
+# 2. disable async weight offload — the most common hard-exit path on gfx1100
 python main.py --disable-async-offload --cpu-vae
 
-# 3. 进一步保守
+# 3. further conservative
 python main.py --lowvram
 ```
 
-其中 `--disable-async-offload` 是这台实例的关键——AMD 上异步权重换入在 22B 推理时最容易硬退出。慢一些，但进程不被打掉。
+`--disable-async-offload` is the key one here. Async weight offload on AMD during 22B inference is the path most likely to die. Slower, but the process survives.
 
-### 1.4 模型文件名大小写陷阱
+### Model filenames: case and suffix
 
-工作流 JSON 里的模型名和云端实际文件名不一致：
+The workflow JSON and the machine disagree:
 
-| 工作流 JSON 里写的 | 云端实际 |
+| In the workflow JSON | Actually on disk |
 |---|---|
 | `ltx-2.3-22b-dev-FP8.Safetensors` | `ltx-2.3-22b-dev.safetensors` |
 | `gemma_3_12B_it_fp4_mixed.safetensors` | `gemma_3_12B_it.safetensors` |
 
-大小写和 `FP8`/`fp4_mixed` 后缀不一致，加载必然失败。
+Case and the `FP8` / `fp4_mixed` suffix differ — the load will fail.
 
-### 1.5 SSH 端口 Connection refused 的判据
+### Connection refused: what it actually means
 
 ```
 PingSucceeded : True
@@ -74,174 +82,132 @@ TcpTestSucceeded : False
 Connection refused
 ```
 
-**这个组合说明**：IP 可达、本机网络正常、密钥根本没机会被验证——是云平台侧 SSH 端口没映射，不是你的问题。
+This combination says: the host is reachable, the local network is fine, and the key was never even tested — the cloud side is not mapping the SSH port. Not your problem.
 
-按这个顺序处理，别重复试 SSH 命令：
+Order of operations, and do not re-run the SSH command in between:
 
-1. 平台页面确认实例状态是「运行中」——「准备好了」不等于运行中
-2. 点「停止」，等状态变「已停止」，再点「启动」
-3. 等 1–3 分钟，重新复制页面上的 SSH 命令（实例重建后端口会变）
-4. 仍失败就联系平台客服，附上实例号、公网 IP、端口
+1. Confirm the instance shows as *running* — "ready" is not the same thing
+2. Stop it, wait for *stopped*, then start again
+3. Wait 1–3 minutes, re-copy the SSH command from the console (the port changes on rebuild)
+4. If it still fails, contact the platform with the instance ID, public IP and port
 
-### 1.6 依赖安装的连环坑
+### The dependency cascade
 
-`--no-deps` 安装会留下二级依赖缺失，然后是一长串连锁：
+Installing with `--no-deps` leaves second-level dependencies missing, and the failures come in a chain:
 
 ```
-缺 packaging / mako
-→ 缺 regex（transformers 的依赖）
-→ 缺 charset_normalizer / urllib3（requests 的依赖）
-→ 缺 multidict / propcache（yarl 的依赖）
-→ 缺 aiohappyeyeballs / aiosignal / attrs / frozenlist（aiohttp 的依赖）
-→ tokenizers 版本冲突
+missing packaging / mako
+→ missing regex (transformers)
+→ missing charset_normalizer / urllib3 (requests)
+→ missing multidict / propcache (yarl)
+→ missing aiohappyeyeballs / aiosignal / attrs / frozenlist (aiohttp)
+→ tokenizers version conflict
 ```
 
-**两个具体坑**：
+Two specifics worth remembering:
 
-- `tokenizers==0.23.0` **在 PyPI 上没有正式版**，只有 rc。降级装 `0.22.2` 而不是找 0.23.0。
-- 系统 Python 受 PEP 668 管理，直接 pip install 会被拦。加 `--break-system-packages` 绕过（容器环境可接受）。
+- `tokenizers==0.23.0` **has no stable release on PyPI**, only rc builds. Downgrade to `0.22.2` instead of hunting for 0.23.0.
+- System Python is governed by PEP 668 and will refuse a plain `pip install`. `--break-system-packages` gets past it (acceptable in a container).
 
-### 1.7 启动参数的正确写法
+### The flag is not what it looks like
 
 ```bash
-# 错误：--disable-custom-nodes 不是有效参数
-# 正确：--disable-all-custom-nodes
+# wrong: --disable-custom-nodes is not a valid flag
+# right: --disable-all-custom-nodes
 ```
 
-启动成功的标志是日志出现 `To see the GUI go to: http://0.0.0.0:8188`。
+Success looks like `To see the GUI go to: http://0.0.0.0:8188` in the log.
 
-### 1.8 通过 Jupyter 代理访问
+### Reaching it through Jupyter
 
-在 JupyterLab 地址栏把 `/lab` 替换成 `/proxy/8188/` 即可访问 ComfyUI。
+Replace `/lab` with `/proxy/8188/` in the JupyterLab URL.
 
-但 `/proxy/` 404 通常是因为**缺 jupyter-server-proxy 扩展**，或者反向代理没转发该路径。装扩展即可，配置文件在 `/opt/venv/etc/jupyter`。
+A 404 on `/proxy/` usually means `jupyter-server-proxy` is missing, or the reverse proxy is not forwarding that path. Config lives in `/opt/venv/etc/jupyter`.
 
-### 1.9 实例销毁前的数据抢救
+### Recovering data before destroying an instance
 
-**仅仅执行命令不能保证「摧毁实例」后文件还在**——实例里的临时磁盘通常会被删除。
+Executing a command does not mean files survive a destroy — the instance's scratch disk is usually deleted.
 
-抢救顺序：先 `df -h` 和 `ls -lah /workspace` 看平台是否提供持久化目录（`/data`、`/mnt`、`/persistent`、`/root/autodl-tmp`），确认后再打包、复制到持久化目录，**最后**才点摧毁。
+Order: `df -h` and `ls -lah /workspace` first, find whether the platform offers a persistent directory (`/data`, `/mnt`, `/persistent`, `/root/autodl-tmp`), pack and copy there, **then** destroy.
 
----
+## Cocos Creator / WeChat mini-game
 
-## 二、Cocos Creator / 微信小游戏
+### Check platform support before building
 
-### 2.1 构建前先确认平台支持
+Confirm the build tool supports `wechatgame` before running a Creator 3.8.8 build. Output goes to `NewProject/build/wechatgame`; the build produces artifacts and engine cache only, never touching gameplay source.
 
-执行 Creator 3.8.8 微信构建前，先确认构建工具支持 `wechatgame` 平台：
+### Bundle constraints
 
-```bash
-# 输出到 NewProject/build/wechatgame
-# 构建只产生产物和引擎缓存，不改玩法源码
-```
+- `ch2-8` sub-package has `isBundle=true`, with **zero cross-bundle references from the main package**
+- 123 textures in the main package needs watching against the 4 MB limit
+- main textures ≤ 1.5 MB
 
-### 2.2 分包与主包约束
+### How a mode registry is validated
 
-- `ch2-8` 分包 `isBundle=true`，**主包零跨分包引用**
-- 主包含 123 张纹理时要注意 4MB 限制
-- 主纹理 ≤1.5MB（见 word-sprite-quest-tooling 的 build.js 检查）
+The refactor checker looks for `onQuestionStart` / `onAnswer` / `onResult` on each gameplay subclass — three methods is the criterion for "implemented".
 
-### 2.3 玩法注册表的判定方式
+## Responsive layout
 
-校验器判定玩法子类「是否只实现三方法」的方式值得注意——重构检查脚本会扫 `onQuestionStart` / `onAnswer` / `onResult` 三个抽象方法是否齐全。
-
----
-
-## 三、响应式布局（移动端）
-
-### 3.1 搜索框必须设 16px
+### Inputs must be 16px
 
 ```css
-input { font-size: 16px; }  /* 避免 iPhone 聚焦时自动放大页面 */
+input { font-size: 16px; }  /* stops iOS Safari zooming on focus */
 ```
 
-小于 16px 时，iPhone 聚焦输入框会触发页面自动缩放。
+Below 16px, iOS zooms the page when the field receives focus.
 
-### 3.2 横向裁切 = 内容「消失」的错觉
+### Horizontal clipping looks like missing content
 
-给 `html/body` 加 `overflow-x: hidden` 或 `overflow-x: clip`，配合依赖横向滑动的导航，会造成「内容其实存在，但手机上看不到」。
+`overflow-x: hidden` on `html/body`, combined with navigation that depends on horizontal scrolling, produces "the content exists but I cannot see it on the phone".
 
-**正确做法**：真正的单列回流 + 完整换行，而不是横向裁切。
+The fix is real single-column reflow with full wrapping — not clipping.
 
-### 3.3 防溢出的三个属性
+### The three properties that stop overflow
 
 ```css
 .card      { overflow-wrap: break-word; }
-.longtext  { word-break: break-all; }   /* 或 overflow-wrap: anywhere */
-.container { min-width: 0; }            /* flex/grid 子项必须 */
+.longtext  { word-break: break-all; }
+.container { min-width: 0; }            /* required on flex/grid children */
 ```
 
-`min-width: 0` 是 flex/grid 布局里最容易被漏的一条——子项默认 `min-width: auto`，会被内部长文本撑宽。
+`min-width: 0` is the one most often missed. A flex or grid child defaults to `min-width: auto` and gets stretched by long text inside it.
 
-### 3.4 320px 的截图工具不可信
+### Do not trust a 320px screenshot tool
 
-截图工具会把浏览器最小布局宽度裁切为输出尺寸，**不能作为严格的手机验证依据**。改用浏览器设备模拟模式（DevTools Device Mode），否则会把裁切结果误判为页面回归。
+Screenshot tools clip the browser's minimum layout width to the output size, so they cannot verify a narrow layout. Use device emulation instead, or you will read a clipping artifact as a page regression.
 
-### 3.5 断点策略
+### Breakpoints
 
-- 320px 及以下：更小的边距和字号
-- 390px：单列操作 + 纵向联系方式
-- 桌面端：保持双列项目布局
+- 320px and below: smaller margins and type
+- 390px: single column, vertical contact block
+- Desktop: two-column project grid
 
----
+## Two product decisions worth recording
 
-## 四、产品定位的两次关键收敛
+### Text input → recording first
 
-这两次不是技术问题，但记录了对产品方向的判断过程。
+A text-first version can demonstrate that a diagnostic pipeline exists. It cannot evaluate pace, pauses, filler words, whether the delivery sounds read, or how confident it feels.
 
-### 4.1 文字输入 → 录音优先
+Recording becomes the primary entry point; text input drops to a backup for structural analysis of a script.
 
-最初版本用文字输入做主入口，实际只能证明「有诊断流程」，不能评价：
+### Generic scenarios → job-talk practice
 
-- 语速是否过快
-- 停顿是否自然
-- 口头禅是否过多
-- 是否像背稿
-- 临场表达是否流畅
+Rather than four parallel expression scenarios, one: practicing a job talk. The reasoning is that the campus is running its own competition, those teams are reachable users on day one, and that is a far stronger case for institutional support than a general-purpose speaking tool.
 
-**结论**：录音才是主入口，文字输入降级为「备用入口」主要用于文稿结构分析。
+## Practice-quiz product notes
 
-低成本实现：浏览器 `MediaRecorder` 本地录音回放 + 时长/活动量/停顿估算 + 转写补充。
+- Sequential mode surfaces unseen questions first
+- Random mode and mock exams skip the most recent 120 seen questions
+- De-duplicate on question + options + answer in non-set mode; keep repeats in set mode (a set reproduces the original paper)
 
-### 4.2 泛化场景 → 聚焦路演
+## Source
 
-不再平铺做四类表达场景，收束为：
-
-> **智言：面向大学生创新创业路演的 AI 语音表达训练平台**
-
-理由：学校正在组织创新大赛，参赛团队就是第一批真实用户，比泛泛做英语学习更容易被认定有校内培育价值。
-
----
-
-## 五、题库产品的两项优化
-
-### 5.1 重复题的处理
-
-- 顺序刷题：优先展示未做题
-- 随机刷题/模拟考试：避开最近 120 道已看题，降低连续重复
-- 非套题模式按「题干 + 选项 + 答案」去重；套题模式保留同题多次出现（还原试卷语境）
-
-### 5.2 部署
-
-GitHub Pages 工作流 `.github/workflows/pages.yml`，静态单文件直接部署，成本 0。
-
----
-
-## 附：记录来源
-
-| 来源 | 数量 | 说明 |
+| Source | Count | What it holds |
 |---|---|---|
-| `.codex/sessions/` | 39 个 rollout | 主要踩坑过程，含完整诊断链 |
-| `.trae-cn/memory/` | 45 个 session_memory | 743 条 learned，结构化摘要 |
-| `.workbuddy/projects/` | 项目会话 | 交付过程记录 |
+| `.codex/sessions/` | 39 rollouts | most of the debugging, with full diagnosis chains |
+| `.trae-cn/memory/` | 45 session memories | 743 structured `learned` entries |
+| `.workbuddy/projects/` | project sessions | delivery records |
 
----
+## Note
 
-## 说明
-
-本笔记只收录**可复用的技术结论**，不含：
-- 具体服务器 IP、端口、实例号（已在文中替换为占位符）
-- 任何 API Key、token
-- 个人隐私信息
-
-每条结论都来自真实调试过程，非推测。
+Only reusable technical conclusions are included. Hostnames, ports and instance IDs have been replaced with placeholders; no API keys or personal information.
